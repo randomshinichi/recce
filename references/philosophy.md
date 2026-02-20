@@ -94,9 +94,9 @@ Before generating, run `sv-discover` from the repo root. This produces a determi
 python3 ~/.pi/agent/skills/recce/scripts/sv-discover [path]
 ```
 
-The discovery output is your **source of truth**. Every function, path, test, and flag you reference in the State Vector must appear in the discovery output. Do not invent names. Do not guess at locations. If it's not in the discovery output, it doesn't exist.
+The discovery output is the **starting ground truth**. Draft from it first, but you may perform targeted reads when they can add WAC-blocking signal. Every function, path, test, and flag you reference in the final State Vector must appear either in the discovery output or in files you actually read. Do not invent names. Do not guess at locations.
 
-Discovery saturates most files in 15 lines. A few files — those where line 15 is still on imports or package metadata — benefit from a targeted read. Which files need reading is itself predictable from the discovery output: if the head bottomed out on boilerplate, the meaningful content is below. Read those files only.
+Discovery saturates most files in 15 lines. Files where line 15 is still imports/package metadata are common targeted-read candidates, but not the only ones. Use judgment: read additional files when the discovery view is ambiguous, routing is unclear, or a likely WAC hinge needs confirmation. Keep reads sparse and purposeful.
 
 ```
 You are writing a State Vector for this scope (repo/subsystem/workspace).
@@ -111,8 +111,8 @@ Output ONLY the State Vector. No commentary, no file-reading plan.
 
 Process (silent):
 1) Identify the top 3–6 dominant Wrong Action Classes (WAC) for this scope.
-2) Using ONLY facts from <discovery>, draft MAP/ROUTES/RULES/HANDLES/DECISIONS with WAC-blocking entries.
-3) Targeted reads: scan the heads in <discovery>. Which files reached line 15 still on import blocks or package metadata? Read exactly those files — and only those. Add any new WAC-blocking facts to the draft. Do not read files whose heads already reached meaningful content.
+2) Draft MAP/ROUTES/RULES/HANDLES/DECISIONS from <discovery> first, with no invented facts.
+3) Targeted reads: use <discovery> to choose files that could materially improve WAC blocking. Boilerplate-only heads are strong candidates, but you may also read other files when needed to resolve ambiguity, confirm boundaries, or locate true edit loci. Keep reads minimal and purposeful.
 4) Delete any entry that is descriptive identity, aspirational, or redundant.
 5) Preserve high-impact entries: do not delete ROUTES/RULES that block severe WACs without replacement.
 6) Cross-check: every function(), path, test name, and --flag you wrote must appear verbatim in <discovery> or in a file you read in step 3. Remove any that don't.

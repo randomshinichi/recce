@@ -16,7 +16,7 @@ description: >
 
 A minimal structured snapshot (MAP / ROUTES / RULES / HANDLES / DECISIONS) that
 blocks Wrong Action Classes (WACs) — the predictable wrong first moves agents
-make when entering a scope cold. Lives in `AGENTS.md` under `## State Vector`.
+make when entering a scope cold.
 
 ## Workflow
 
@@ -41,19 +41,17 @@ Pipe output as the `<discovery>` block in the Section V prompt.
 
 Follow the 8-step process in `references/philosophy.md` Section V exactly:
 1. Identify WACs
-2. Draft from discovery only
-3. Targeted reads (files whose heads bottomed out on boilerplate)
+2. Draft from discovery first (no invention)
+3. Do targeted reads when useful (not just boilerplate heads); choose files that can add WAC-blocking signal
 4. Delete non-WAC entries
 5. Preserve high-impact entries
 6. Cross-check every reference against discovery or files read in step 3
 7. Refine ROUTES
 8. Prune to ≤50 lines
 
-### 3. Place the result
+### 3. Print the result
 
-Paste the State Vector into `AGENTS.md` under `## State Vector`. Gate entry:
-
-> This section may only be updated using the recce skill.
+Output the State Vector verbatim. Do not write it to any file unless explicitly asked.
 
 ## Key constraints (memorise these — don't re-read philosophy.md for them)
 
