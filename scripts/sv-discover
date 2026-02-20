@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+"""sv-discover — Deterministic repo discovery for State Vector generation.
+
+Outputs section-tagged evidence for the LLM to synthesize a State Vector.
+
+Two modes:
+  --code     Force code discovery (functions, tests, CLI, constants)
+  --content  Force content discovery (file types, sizes, archives, heads)
+  (default)  Auto-detect: code if language manifests found, content otherwise
+
+Tier system (content mode only):
+  NORMAL  (<300 files)   Full analysis — all levels
+  LARGE   (300–cap)      File types, line endings, heads for top 30 by size
+  MASSIVE (cap hit)      Tree + inventory only; no content reads
+
+Usage: ./tools/sv-discover [--code|--content] [--max-files N] [--max-depth N] [repo_root]
+"""
+
+import argparse
+import collections
+import os
+import stat as stat_mod
+import subprocess
+import tarfile
+import zipfile
+from pathlib import Path
+
+# ── Args ─────────────────────────────────────────────────────────────────────
+
+parser = argparse.ArgumentParser(
+    description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+)
+mode_group = parser.add_mutually_exclusive_group()
+mode_group.add_argument("--code",    action="store_true", help="Force code discovery mode")
+mode_group.add_argument("--content", action="store_true", help="Force content discovery mode")
+parser.add_argument("--max-files", type=int, default=2000,
+                    help="Walk cap: stop collecting after N files (default: 2000)")
+parser.add_argument("--max-depth", type=int, default=999,
+                    help="Max directory depth to walk (default: unlimited)")
+parser.add_argument("root", nargs="?", default=".", help="Repo/folder root (default: .)")
+args = parser.parse_args()
+
+ROOT = Path(args.root).resolve()
+os.chdir(ROOT)
+
+MAX_FILES = args.max_files
+MAX_DEPTH = args.max_depth
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+EXCLUDE_DIRS = {
+    ".venv", "node_modules", "__pycache__", ".git", "target",
+    "dist", "build", ".mypy_cache", ".pytest_cache", ".tox", "vendor", ".beads",
+    "__MACOSX",
+}
+
+# Absolute paths to skip entirely (virtual filesystems — reads can hang)
+VIRTUAL_FS_ROOTS = {"/proc", "/sys", "/dev", "/run"}
+
+ARCHIVE_EXTS = {".zip", ".gz", ".bz2", ".tgz", ".tar", ".xz", ".7z"}
+
+BINARY_SKIP_EXTS = {
+    ".zip", ".gz", ".bz2", ".tgz", ".tar", ".xz", ".7z",
+    ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".bin",
+    ".o", ".a", ".so", ".dylib", ".exe", ".dmg", ".img",
+}
+
+# ── Shared helpers ────────────────────────────────────────────────────────────
+
+def section(tag: str, title: str):
+    print(f"\n=== {tag}: {title} ===")
+
+
+def fmt_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n}{unit}"
+        n //= 1024
+    return f"{n}TB"
+
+
+def run(*cmd, timeout: int = 10) -> str:
+    try:
+        r = subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+def rg(pattern: str, *, globs: list[str] | None = None,
+        extra: list[str] | None = None, limit: int = 60) -> str:
+    """Run ripgrep. Never raises on no-match."""
+    cmd = ["rg", "--no-heading", "-n", pattern]
+    for d in EXCLUDE_DIRS:
+        cmd += ["-g", f"!{d}"]
+    for g in (globs or []):
+        cmd += ["-g", g]
+    cmd += extra or []
+    cmd += ["--max-count", "200"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        lines = r.stdout.strip().splitlines()
+        return "\n".join(lines[:limit])
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+def is_binary(raw: bytes) -> bool:
+    return b"\x00" in raw[:8192]
+
+
+def detect_line_endings(raw: bytes) -> str:
+    if b"\r\n" in raw:
+        return "CRLF"
+    elif b"\r" in raw:
+        return "CR (classic Mac — use `tr '\\r' '\\n'` before line tools)"
+    elif b"\n" in raw:
+        return "LF"
+    return "none"
+
+
+def normalize_lines(raw: bytes, limit: int = 15) -> list[str]:
+    """Normalize line endings and return up to `limit` lines."""
+    normalized = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    try:
+        text = normalized.decode("utf-8", errors="replace")
+    except Exception:
+        text = normalized.decode("latin-1", errors="replace")
+    return text.splitlines()[:limit]
+
+
+def safe_read(p: Path, max_bytes: int = 4 * 1024 * 1024) -> bytes | None:
+    """Read a regular, non-empty file up to max_bytes. Returns None on any issue."""
+    try:
+        st = p.stat()
+        if not stat_mod.S_ISREG(st.st_mode):   # skip virtual FS pseudo-files
+            return None
+        if st.st_size == 0:                      # skip empty / virtual files
+            return None
+        if st.st_size > max_bytes:
+            with open(p, "rb") as f:
+                return f.read(max_bytes)
+        return p.read_bytes()
+    except OSError:
+        return None
+
+
+def batch_file_types(paths: list[Path]) -> dict[Path, str]:
+    """Run `file --brief` on all paths in chunks of 1500 (ARG_MAX safety)."""
+    result: dict[Path, str] = {}
+    for i in range(0, len(paths), 1500):
+        chunk = paths[i : i + 1500]
+        cmd = ["file", "--brief"] + [str(p) for p in chunk]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            for path, line in zip(chunk, r.stdout.splitlines()):
+                result[path] = line.strip()
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+    return result
+
+
+# ── Breadth-first bounded walk ────────────────────────────────────────────────
+
+def bounded_walk(root: Path, max_files: int, max_depth: int
+                 ) -> tuple[list[tuple[int, Path]], bool]:
+    """
+    Breadth-first walk. Prunes EXCLUDE_DIRS and VIRTUAL_FS_ROOTS at dir level.
+    Returns ([(size, path), ...], was_capped).
+    was_capped=True means we hit max_files before finishing.
+    """
+    files: list[tuple[int, Path]] = []
+    # Queue: (dir_path, depth)
+    queue: collections.deque[tuple[Path, int]] = collections.deque([(root, 0)])
+
+    while queue:
+        dir_path, depth = queue.popleft()
+
+        # Skip virtual filesystem roots by absolute path
+        if str(dir_path) in VIRTUAL_FS_ROOTS:
+            continue
+
+        if depth > max_depth:
+            continue
+
+        try:
+            entries = sorted(os.scandir(dir_path), key=lambda e: e.name)
+        except (PermissionError, OSError):
+            continue
+
+        for entry in entries:
+            try:
+                # Never follow symlinks
+                if entry.is_symlink():
+                    continue
+
+                if entry.is_dir(follow_symlinks=False):
+                    if entry.name not in EXCLUDE_DIRS:
+                        queue.append((Path(entry.path), depth + 1))
+
+                elif entry.is_file(follow_symlinks=False):
+                    st = entry.stat(follow_symlinks=False)
+                    if stat_mod.S_ISREG(st.st_mode):
+                        files.append((st.st_size, Path(entry.path)))
+                        if len(files) >= max_files:
+                            return files, True
+            except OSError:
+                continue
+
+    return files, False
+
+
+# ── Tree ──────────────────────────────────────────────────────────────────────
+
+def tree(depth: int = 3) -> str:
+    excl_pattern = "|".join(EXCLUDE_DIRS)
+    out = run("tree", "-L", str(depth), "--dirsfirst", "-I", excl_pattern, "--charset", "ascii")
+    if out:
+        return out
+    # Fallback: build from a fresh shallow walk (no rglob)
+    lines: list[str] = []
+    queue: collections.deque[tuple[Path, int]] = collections.deque([(ROOT, 0)])
+    while queue:
+        d, dep = queue.popleft()
+        if dep > depth:
+            continue
+        try:
+            entries = sorted(os.scandir(d), key=lambda e: (not e.is_dir(), e.name))
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.name in EXCLUDE_DIRS or entry.is_symlink():
+                continue
+            rel = str(Path(entry.path).relative_to(ROOT))
+            lines.append("  " * dep + rel)
+            if entry.is_dir(follow_symlinks=False) and dep < depth:
+                queue.append((Path(entry.path), dep + 1))
+    return "\n".join(lines)
+
+
+# ── Language detection ────────────────────────────────────────────────────────
+
+LANG_MANIFEST: dict[str, tuple[str, list[str]]] = {
+    "pyproject.toml": ("python",     ["*.py"]),
+    "setup.py":       ("python",     ["*.py"]),
+    "Cargo.toml":     ("rust",       ["*.rs"]),
+    "package.json":   ("javascript", ["*.js", "*.ts", "*.tsx"]),
+    "go.mod":         ("go",         ["*.go"]),
+    "build.gradle":   ("java",       ["*.java", "*.kt"]),
+    "pom.xml":        ("java",       ["*.java", "*.kt"]),
+    "mix.exs":        ("elixir",     ["*.ex", "*.exs"]),
+    "Gemfile":        ("ruby",       ["*.rb"]),
+    "CMakeLists.txt": ("c_cpp",      ["*.c", "*.cpp", "*.h", "*.hpp"]),
+}
+
+langs: set[str] = set()
+src_globs: list[str] = []
+
+for manifest, (lang, gs) in LANG_MANIFEST.items():
+    if Path(manifest).exists():
+        langs.add(lang)
+        src_globs.extend(gs)
+
+seen_globs: set[str] = set()
+src_globs = [g for g in src_globs if not (g in seen_globs or seen_globs.add(g))]  # type: ignore
+
+# ── Mode selection ────────────────────────────────────────────────────────────
+
+if args.code:
+    mode = "code"
+elif args.content:
+    mode = "content"
+else:
+    mode = "code" if langs else "content"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CODE DISCOVERY  (unchanged — rg handles scale itself)
+# ══════════════════════════════════════════════════════════════════════════════
+
+if mode == "code":
+    print(f"=== MODE: code ===")
+    if not src_globs:
+        src_globs = ["*.py", "*.rs", "*.ts", "*.js", "*.go", "*.java", "*.rb"]
+
+    print(f"=== DETECTED LANGUAGES: {', '.join(sorted(langs)) or 'unknown'} ===")
+    print(f"=== SOURCE GLOBS: {' '.join(src_globs)} ===")
+
+    section("FOR MAP", "Repo tree (depth 3)")
+    print(tree(3))
+
+    section("FOR MAP + DECISIONS", "Manifests")
+    MANIFEST_FILES = [
+        "pyproject.toml", "Cargo.toml", "package.json", "go.mod",
+        "build.gradle", "pom.xml", "Makefile", "Dockerfile",
+        "docker-compose.yml", ".envrc",
+    ]
+    for f in MANIFEST_FILES:
+        p = Path(f)
+        if p.exists():
+            print(f"--- {f} ---")
+            lines = p.read_text().splitlines()
+            print("\n".join(lines[:60]))
+            if len(lines) > 60:
+                print(f"  ... ({len(lines) - 60} more lines)")
+            print()
+
+    section("FOR MAP", "External path references (outside repo)")
+    print(rg(r"Path\.home|expanduser|home_dir|dirs::|~\/\.", globs=src_globs))
+
+    section("FOR MAP", "Environment variable usage")
+    print(rg(r"os\.getenv|os\.environ|env::var|std::env|process\.env\.|os\.Getenv", globs=src_globs))
+
+    section("FOR MAP", "Lock / mutex / singleton patterns")
+    print(rg(r"flock|fcntl|FileLock|Mutex|RwLock|\.lock\(|single.instance", globs=src_globs))
+
+    section("FOR ROUTES", "Function and type definitions")
+    if "python" in langs:
+        print("# Python top-level definitions")
+        print(rg(r"^(def |class )", globs=["*.py"], limit=80))
+        print("\n# Python methods (indented defs)")
+        print(rg(r"^    def ", globs=["*.py"], limit=60))
+    if "rust" in langs:
+        print("\n# Rust definitions")
+        print(rg(r"^(pub )?(fn |struct |enum |impl )", globs=["*.rs"], limit=80))
+    if "javascript" in langs:
+        print("\n# JS/TS definitions")
+        print(rg(r"^export (function|const|class|default)", globs=["*.js", "*.ts", "*.tsx"], limit=80))
+    if "go" in langs:
+        print("\n# Go definitions")
+        print(rg(r"^(func |type )", globs=["*.go"], limit=80))
+
+    section("FOR ROUTES", "Test index (available guards)")
+    if "python" in langs:
+        print(rg(r"def test_", globs=["*.py"], limit=40))
+    if "rust" in langs:
+        print(rg(r"#\[test\]", globs=["*.rs"], extra=["-A1"], limit=40))
+    if "javascript" in langs:
+        print(rg(r'(it|test|describe)\(', globs=["*.ts", "*.js", "*.tsx"], limit=40))
+    if "go" in langs:
+        print(rg(r"^func Test", globs=["*.go"], limit=40))
+
+    section("FOR HANDLES", "CLI entry points and subcommands")
+    if "python" in langs:
+        print("# Python argparse / click / typer")
+        print(rg(r"add_parser|add_subparsers|add_argument|@click\.|@app\.", globs=["*.py"], limit=50))
+    if "rust" in langs:
+        print("\n# Rust clap")
+        print(rg(r"#\[command|#\[arg|Subcommand", globs=["*.rs"], limit=30))
+    if "javascript" in langs:
+        print("\n# JS/TS CLI")
+        print(rg(r"\.command\(|yargs\.|commander\.", globs=["*.ts", "*.js"], limit=30))
+    if Path("package.json").exists():
+        import json
+        try:
+            scripts = json.loads(Path("package.json").read_text()).get("scripts", {})
+            if scripts:
+                print("\n# package.json scripts")
+                for k, v in scripts.items():
+                    print(f"  {k}: {v}")
+        except Exception:
+            pass
+    if Path("Makefile").exists():
+        print("\n# Makefile targets")
+        print(rg(r"^[a-zA-Z_-]+:", globs=["Makefile"], limit=20))
+
+    section("FOR HANDLES", "Executable scripts")
+    # Use bounded walk to find executables (avoids unbounded rglob)
+    exec_files, _ = bounded_walk(ROOT, max_files=5000, max_depth=MAX_DEPTH)
+    for _sz, p in sorted(exec_files, key=lambda x: x[1]):
+        if p.suffix in (".sh", ".bash", ".py") and os.access(p, os.X_OK):
+            print(f"  {p.relative_to(ROOT)}")
+
+    section("FOR RULES", "Constants and configuration")
+    print(rg(r"^[A-Z][A-Z_]{2,}\s*=", globs=src_globs, limit=30))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONTENT DISCOVERY  (tiered by file count)
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif mode == "content":
+
+    # ── Walk ────────────────────────────────────────────────────────────────
+
+    all_sized, was_capped = bounded_walk(ROOT, MAX_FILES, MAX_DEPTH)
+    all_sized.sort(reverse=True)   # largest first throughout
+
+    file_count = len(all_sized)
+
+    # ── Tier assignment ──────────────────────────────────────────────────────
+    #
+    # Degradation ladder:
+    #   Level 0  (always)    tree + file inventory (top 80 by size)
+    #   Level 1  (≥NORMAL)   archive contents (top 3 by size)
+    #   Level 2  (≥NORMAL)   file types (batched `file` command)
+    #   Level 3  (≥NORMAL)   line endings (top 50 by size, 8KB reads)
+    #   Level 4  (≥NORMAL)   text file heads (top 30 by size)
+    #   Level 5  (NORMAL)    text file heads for all files
+    #
+    # NORMAL  → levels 0–5   (walk completed, <300 files)
+    # LARGE   → levels 0–4   (walk completed, 300–cap files)
+    # MASSIVE → level 0 only (walk hit cap)
+
+    if was_capped:
+        tier = "MASSIVE"
+        tier_level = 0
+    elif file_count >= 300:
+        tier = "LARGE"
+        tier_level = 4
+    else:
+        tier = "NORMAL"
+        tier_level = 5
+
+    if was_capped:
+        tier_note = f"capped at {MAX_FILES} — deeper directories not scanned"
+        print(f"=== MODE: content | {tier} ({file_count} files collected; {tier_note}) ===")
+    else:
+        print(f"=== MODE: content | {tier} ({file_count} files) ===")
+
+    # Convenience slices
+    top80:  list[tuple[int, Path]] = all_sized[:80]
+    top50:  list[tuple[int, Path]] = all_sized[:50]
+    top30:  list[tuple[int, Path]] = all_sized[:30]
+    top3_archives = [(s, p) for s, p in all_sized
+                     if p.suffix.lower() in ARCHIVE_EXTS][:3]
+
+    # ── Level 0: Tree + Inventory ─────────────────────────────────────────────
+
+    tree_depth = 2 if tier == "MASSIVE" else 3
+    section("FOR MAP", f"Repo tree (depth {tree_depth})")
+    print(tree(tree_depth))
+
+    section("FOR MAP", f"File inventory — top {len(top80)} by size"
+            + (" (walk capped — not all files shown)" if was_capped else ""))
+    for size, p in top80:
+        print(f"  {fmt_size(size):>8}  {p.relative_to(ROOT)}")
+
+    if tier_level < 1:
+        print("\n=== DISCOVERY COMPLETE ===")
+        raise SystemExit(0)
+
+    # ── Level 1: Archive contents ─────────────────────────────────────────────
+
+    section("FOR MAP", "Archive contents (top 3 by size)")
+    if not top3_archives:
+        print("  (no archives found)")
+    for _sz, arc in top3_archives:
+        print(f"\n--- {arc.relative_to(ROOT)} ---")
+        if arc.suffix.lower() == ".zip":
+            try:
+                with zipfile.ZipFile(arc) as z:
+                    entries = z.infolist()
+                    for e in entries[:40]:
+                        print(f"  {fmt_size(e.file_size):>8}  {e.filename}")
+                    if len(entries) > 40:
+                        print(f"  ... ({len(entries) - 40} more entries)")
+            except Exception as e:
+                print(f"  (could not open: {e})")
+        elif tarfile.is_tarfile(str(arc)):
+            try:
+                with tarfile.open(arc) as t:
+                    members = t.getmembers()
+                    for m in members[:40]:
+                        print(f"  {fmt_size(m.size):>8}  {m.name}")
+                    if len(members) > 40:
+                        print(f"  ... ({len(members) - 40} more entries)")
+            except Exception as e:
+                print(f"  (could not open: {e})")
+        else:
+            print("  (unsupported archive format)")
+
+    # ── Levels 2 + 3: File types and line endings (combined section) ──────────
+
+    section("FOR RULES", "File types and line endings (top 50 by size)")
+
+    # Level 2: batch file-type detection
+    file_type_map: dict[Path, str] = {}
+    if run("which", "file"):
+        paths_for_file = [p for _, p in top50]
+        file_type_map = batch_file_types(paths_for_file)
+
+    # Level 3: line endings from first 8KB
+    for _size, p in top50:
+        rel = str(p.relative_to(ROOT))
+        ftype = file_type_map.get(p, "")
+
+        # Read first 8KB only for line-ending probe
+        raw8k: bytes | None = None
+        try:
+            st = p.stat()
+            if stat_mod.S_ISREG(st.st_mode) and st.st_size > 0:
+                with open(p, "rb") as f:
+                    raw8k = f.read(8192)
+        except OSError:
+            pass
+
+        if raw8k is None:
+            endings = "unreadable"
+        elif is_binary(raw8k):
+            endings = "binary"
+        else:
+            endings = detect_line_endings(raw8k)
+
+        flag = ""
+        if "CR (" in endings:
+            flag = " ← non-standard, needs tr"
+        elif endings == "binary":
+            flag = " ← binary"
+
+        label = ftype or ("binary" if endings == "binary" else "text")
+        print(f"  {rel:<50}  {endings:<8}  {label}{flag}")
+
+    # ── Levels 4 + 5: Text file heads ─────────────────────────────────────────
+
+    head_pool = top30 if tier_level < 5 else all_sized
+    head_label = "top 30 by size" if tier_level < 5 else "all text files"
+
+    section("FOR ROUTES", f"Text file heads — first 15 lines, normalized ({head_label})")
+    MAX_HEAD_BYTES = 4 * 1024 * 1024
+
+    for _size, p in head_pool:
+        if p.suffix.lower() in BINARY_SKIP_EXTS:
+            continue
+        raw = safe_read(p, MAX_HEAD_BYTES)
+        if raw is None:
+            continue
+        if is_binary(raw):
+            continue
+        lines = normalize_lines(raw, limit=15)
+        size_str = fmt_size(_size)
+        if _size > MAX_HEAD_BYTES:
+            print(f"\n--- {p.relative_to(ROOT)} ({size_str}, truncated to 4MB) ---")
+        else:
+            print(f"\n--- {p.relative_to(ROOT)} ---")
+        for i, line in enumerate(lines, 1):
+            print(f"  {i:>3}: {line}")
+
+print("\n=== DISCOVERY COMPLETE ===")
