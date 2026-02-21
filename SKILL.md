@@ -27,11 +27,15 @@ orientation — readable in 30 seconds, holdable in human working memory.
 **`--deep`:** Two outputs:
 1. **Deep State Vector** — no line limit; covers subsystem-level invariants,
    protocol internals, type system constraints, silent limits; annotate each
-   entry with the WAC it blocks. Calibrated for frontier AI agents with large
-   context windows working an extended session.
+   entry with the WAC it blocks. Optionally add risk metadata only when it
+   changes action: `[D:silent|caught] [C:0.10-1.00] [F:stable|verify|volatile]`.
+   Use `C` in 0.05 increments; default uncertain cases to `D:silent`, `F:verify`,
+   and `C<=0.65`. Calibrated for frontier AI agents with large context windows
+   working an extended session.
 2. **Distilled State Vector** — ≤50 lines mined from the deep version; the
-   subset that blocks the first 3–5 hours of wrong moves. Calibrated for human
-   readers and smaller models.
+   subset that blocks the first 3–5 hours of wrong moves. Hide metadata tags by
+   default; include only when omitting them would likely cause a wrong move.
+   Calibrated for human readers and smaller models.
 
 Always read `references/philosophy.md` before generating. Section V contains the
 full generation prompt, selection criteria, and anti-examples.
@@ -53,7 +57,7 @@ Auto-detects code vs content mode. Options:
 
 ### 2. Generate
 
-Follow the 8-step process in `references/philosophy.md` Section V exactly:
+Follow the process in `references/philosophy.md` Section V exactly:
 1. Identify WACs
 2. Draft from discovery only (no invention)
 3. Targeted reads: files whose heads bottomed out on boilerplate, and any file
@@ -110,6 +114,14 @@ a read file must be removed.
 ### 3. Generate the deep State Vector
 
 No line limit. Every entry must still block a WAC — annotate each with `_(WAC-N)_`.
+For entries that are action-driving, ambiguous, or high-risk, add metadata tags:
+`[D:silent|caught]` (detectability), `[C:0.10-1.00]` (confidence, 0.05 steps),
+`[F:stable|verify|volatile]` (freshness).
+Assignment defaults: if no concrete guard is named use `D:silent`; if evidence
+is thin cap at `C:0.65`; if drift is unclear use `F:verify`.
+If any D/C/F tags are used, include a `LEGEND:` block near the top of the deep
+State Vector defining each tag, each value, and what each value means in action
+terms.
 Subsystem-specific appendices are acceptable (e.g. protocol wire event tables)
 but label them "reference only, not WAC-blocking" so they don't inflate the WAC
 signal.
@@ -122,8 +134,10 @@ subsystem you enter. Leave subsystem-specific entries (protocol internals, batch
 rate-limiting details) in the deep version only.
 
 Apply the ≤50-line ceiling and the WAC-only selection criteria from
-`references/philosophy.md`. The distilled version must stand alone — a reader
-who has not seen the deep version should be fully oriented by it.
+`references/philosophy.md`. Keep D/C/F tags only when they change what the next
+actor should do (for example: low-confidence, silent-failure, or volatile facts).
+The distilled version must stand alone — a reader who has not seen the deep
+version should be fully oriented by it.
 
 ### 5. Print both
 
@@ -143,3 +157,12 @@ These apply to both modes. Memorise — don't re-read philosophy.md for them.
 - No ACTIVE section in either output — goes stale; use task tracker instead
 - The deep State Vector is calibrated for frontier AI agents; the distilled for
   humans and smaller models — do not conflate the audiences
+- D/C/F metadata is optional and selective: show it when it changes action,
+  otherwise omit to preserve signal density
+- If no concrete guard is named, default detectability to `D:silent`
+- If evidence is thin, cap confidence at `C:0.65`; if drift is unclear, default
+  freshness to `F:verify`
+- If any D/C/F tags appear in deep output, include a `LEGEND:` section that
+  defines D, C, F and explains each value/state in action semantics
+- Confidence is numeric (`C:0.10-1.00`) in 0.05 increments
+- Claims with `C>=0.90` should include a provenance anchor `(path | doc | PR#)`
