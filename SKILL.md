@@ -1,28 +1,44 @@
 ---
 name: recce
 description: >
-  Generate or update a State Vector — a curated ≤50-line project snapshot that
-  prevents predictable wrong first moves for agents entering a scope cold. Use
-  when asked to: create a State Vector, update an existing State Vector, write
-  the State Vector section of AGENTS.md, or summarize a project into a
-  structured WAC-blocking snapshot. Triggers on phrases like "recce",
-  "run recce", "sitrep", "recon", "State Vector", "project snapshot",
-  "AGENTS.md state", or "what should the State Vector look like for this repo".
+  Generate or update a State Vector — a structured project snapshot that prevents
+  predictable wrong first moves for agents entering a scope cold. Two modes:
+  --fast (default) produces a curated ≤50-line snapshot; --deep reads all source
+  files, mines subsystem-level invariants, and outputs both a comprehensive deep
+  State Vector and a distilled ≤50-line version for human/smaller-model handoff.
+  Use when asked to: create a State Vector, update an existing State Vector, write
+  the State Vector section of AGENTS.md, or summarize a project. Triggers on
+  phrases like "recce", "run recce", "sitrep", "recon", "State Vector", "project
+  snapshot", "AGENTS.md state", "recce --fast", "recce --deep", or "what should
+  the State Vector look like for this repo".
 ---
 
 # State Vector Skill
 
 ## What this produces
 
-A minimal structured snapshot (MAP / ROUTES / RULES / HANDLES / DECISIONS) that
-blocks Wrong Action Classes (WACs) — the predictable wrong first moves agents
-make when entering a scope cold.
+A structured snapshot (MAP / ROUTES / RULES / HANDLES / DECISIONS) that blocks
+Wrong Action Classes (WACs) — the predictable wrong first moves agents make when
+entering a scope cold.
 
-## Workflow
+**`--fast` (default):** A single ≤50-line State Vector. Calibrated for immediate
+orientation — readable in 30 seconds, holdable in human working memory.
 
-**Always read `references/philosophy.md` before generating or updating a State
-Vector.** Section V contains the self-contained generation prompt with full
-selection criteria, section guidance, and anti-examples.
+**`--deep`:** Two outputs:
+1. **Deep State Vector** — no line limit; covers subsystem-level invariants,
+   protocol internals, type system constraints, silent limits; annotate each
+   entry with the WAC it blocks. Calibrated for frontier AI agents with large
+   context windows working an extended session.
+2. **Distilled State Vector** — ≤50 lines mined from the deep version; the
+   subset that blocks the first 3–5 hours of wrong moves. Calibrated for human
+   readers and smaller models.
+
+Always read `references/philosophy.md` before generating. Section V contains the
+full generation prompt, selection criteria, and anti-examples.
+
+---
+
+## --fast workflow
 
 ### 1. Run discovery
 
@@ -35,28 +51,95 @@ Auto-detects code vs content mode. Options:
 - `--max-files N` — cap walk (default 2000)
 - `--max-depth N` — limit tree depth
 
-Pipe output as the `<discovery>` block in the Section V prompt.
-
 ### 2. Generate
 
 Follow the 8-step process in `references/philosophy.md` Section V exactly:
 1. Identify WACs
-2. Draft from discovery first (no invention)
-3. Do targeted reads when useful (not just boilerplate heads); choose files that can add WAC-blocking signal
+2. Draft from discovery only (no invention)
+3. Targeted reads: files whose heads bottomed out on boilerplate, and any file
+   whose content would likely block a WAC not yet covered
 4. Delete non-WAC entries
 5. Preserve high-impact entries
 6. Cross-check every reference against discovery or files read in step 3
 7. Refine ROUTES
 8. Prune to ≤50 lines
 
-### 3. Print the result
+### 3. Print
 
-Output the State Vector verbatim. Do not write it to any file unless explicitly asked.
+Output the State Vector verbatim. Do not write to any file unless asked.
 
-## Key constraints (memorise these — don't re-read philosophy.md for them)
+---
+
+## --deep workflow
+
+### 1. Run discovery (same as --fast)
+
+Establishes the verified fact base and project topology.
+
+### 2. Systematic file reading
+
+Do not limit yourself to truncated heads. Read source files in this priority order,
+stopping when a file yields no new WAC-blocking facts:
+
+1. **Constraint inheritance** — base classes, core interfaces, error contracts,
+   serialization requirements, or any design decision in one place that forces a
+   pattern everywhere else. These explain *why* the whole codebase made certain
+   choices that otherwise look arbitrary.
+2. **Look-alike traps** — things that appear to be X but are actually Y: the same
+   function name in two modules, a default value that differs from caller
+   expectation, an enum default that differs from function defaults, a fallback
+   literal that silently changes behaviour. The gap between appearance and reality
+   is the highest-value class of fact.
+3. **Buried thresholds** — hardcoded limits, timeouts, retry counts, rate limits,
+   batch caps, and delays embedded in business logic. Invisible at the call site,
+   only visible in the implementation.
+4. **Format invariants** — wire formats, serialization field names, URL structure
+   per endpoint domain, framing protocols, extended parameter encodings. Anything
+   where the format looks arbitrary but is actually mandatory.
+5. **API surface vs internal layout** — re-exports, star imports, name collisions
+   across modules, functions with identical names in sibling modules, public
+   facades that hide internal structure.
+6. **Auth and session mechanics** — login endpoints, credential key names,
+   fallback token literals, MFA detection patterns, session cookie formats.
+7. **Test fixture coupling** — hardcoded counts or specific values in assertions
+   that break silently if fixture data is modified.
+
+Cross-reference everything against discovery output. Any name not in discovery or
+a read file must be removed.
+
+### 3. Generate the deep State Vector
+
+No line limit. Every entry must still block a WAC — annotate each with `_(WAC-N)_`.
+Subsystem-specific appendices are acceptable (e.g. protocol wire event tables)
+but label them "reference only, not WAC-blocking" so they don't inflate the WAC
+signal.
+
+### 4. Distil to the standard State Vector
+
+From the deep version, select the entries that block wrong moves in the first
+3–5 hours of working in the codebase — the ones that apply regardless of which
+subsystem you enter. Leave subsystem-specific entries (protocol internals, batch
+rate-limiting details) in the deep version only.
+
+Apply the ≤50-line ceiling and the WAC-only selection criteria from
+`references/philosophy.md`. The distilled version must stand alone — a reader
+who has not seen the deep version should be fully oriented by it.
+
+### 5. Print both
+
+Output the deep State Vector first, then the distilled State Vector. Label them
+clearly. Do not write to any file unless asked.
+
+---
+
+## Key constraints
+
+These apply to both modes. Memorise — don't re-read philosophy.md for them.
 
 - Every entry must block a WAC — no exceptions, no orientation entries
 - ROUTES = where to EDIT source; HANDLES = what to RUN — never cross them
 - Pruning bias: omit when unsure; deletion is the default
-- ≤50 lines soft ceiling; >50 requires explicit justification
-- No ACTIVE section — goes stale; use task tracker instead
+- ≤50 lines applies to the distilled output only; deep has no ceiling
+- No ACTIVE section in either output — goes stale; use task tracker instead
+- The deep State Vector is calibrated for frontier AI agents; the distilled for
+  humans and smaller models — do not conflate the audiences
